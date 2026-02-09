@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""
+RetiMsg Client - Minimalist LXMF messaging interface
+Interactive terminal client for sending/receiving messages via retimsg daemon.
+"""
+
+import os
+import sys
+import json
+import socket
+import time
+import threading
+import readline  # Enables arrow keys and command history in input()
+from datetime import datetime
+from pathlib import Path
+from inotify_simple import INotify, flags
+
+# Security limit
+MAX_RESPONSE_SIZE = 2 * 1024 * 1024  # 2MB response limit
+
+def clean_hash(hash_input):
+    """Clean a hash from RNS format to plain hex string
+    
+    Handles both RNS.prettyhexrep output (with angle brackets) and raw strings.
+    Returns lowercase hex string without formatting.
+    Raises ValueError if input is None or empty.
+    """
+    if hash_input is None:
+        raise ValueError("Hash cannot be None")
+    
+    if isinstance(hash_input, bytes):
+        return hash_input.hex()
+    
+    hash_str = str(hash_input).strip()
+    if not hash_str:
+        raise ValueError("Hash cannot be empty")
+    
+    return hash_str.replace("<", "").replace(">", "").replace(" ", "").lower()
+
+class RetiMsgClient:
+    def __init__(self):
+        self.config_dir = Path.home() / ".retimsg"
+        self.config_file = self.config_dir / "config.json"
+        self.messages_file = self.config_dir / "messages.jsonl"
+        self.contacts_file = self.config_dir / "contacts.json"
+        self.socket_path = self.config_dir / "daemon.sock"
+        
+        # Ensure .retimsg directory exists
+        self.config_dir.mkdir(exist_ok=True)
+        
+        # Check if daemon is running
+        if not self.socket_path.exists():
+            print(f"Error: Socket not found at {self.socket_path}")
+            print("Is the daemon running? Start with: python3 retimsg_daemon.py")
+            sys.exit(1)
+        
+        # Test connection
+        test_response = self._send_daemon_command({"action": "ping"})
+        if test_response.get("status") != "ok":
+            print(f"Error: Cannot communicate with daemon: {test_response.get('message')}")
+            sys.exit(1)
+        
+        print("Connected to daemon successfully")
+        
+        # Load config
+        self.config = self._load_config()
+        self.contacts = self._load_contacts()
+        self.active_conversation = self.config.get("active_conversation")
+        
+        # Clean up active conversation hash if it has brackets
+        if self.active_conversation:
+            try:
+                cleaned = clean_hash(self.active_conversation)
+                if cleaned != self.active_conversation:
+                    self.active_conversation = cleaned
+                    self.config['active_conversation'] = cleaned
+                    with open(self.config_file, 'w') as f:
+                        json.dump(self.config, f, indent=2)
+            except ValueError:
+                # Invalid hash in config, reset it
+                self.active_conversation = None
+                self.config['active_conversation'] = None
+        
+        self.last_message_count = 0
+        self.watching = False
+        self.watch_thread = None
+    
+    def _load_config(self):
+        """Load configuration"""
+        if not self.config_file.exists():
+            return {"active_conversation": None}
+        with open(self.config_file, 'r') as f:
+            return json.load(f)
+    
+    def _load_contacts(self):
+        """Load contacts/address book"""
+        if not self.contacts_file.exists():
+            return {}
+        with open(self.contacts_file, 'r') as f:
+            return json.load(f)
+    
+    def _save_contacts(self):
+        """Save contacts to disk"""
+        with open(self.contacts_file, 'w') as f:
+            json.dump(self.contacts, f, indent=2)
+    
+    def _get_contact_name(self, hash_str):
+        """Get nickname for a hash, or return short hash if no nickname"""
+        if hash_str in self.contacts:
+            return self.contacts[hash_str]
+        return hash_str[:8] + "..."  # First 8 chars of hash
+    
+    def _hash_from_name_or_hash(self, input_str):
+        """Convert nickname or hash to hash"""
+        # Clean input
+        input_str = clean_hash(input_str)
+        
+        # Check if it's a nickname
+        for hash_val, nickname in self.contacts.items():
+            if nickname.lower() == input_str.lower():
+                return hash_val
+        
+        # Otherwise assume it's a hash
+        return input_str
+    
+    def _send_daemon_command(self, command):
+        """Send command to daemon via Unix socket"""
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5.0)  # 5 second timeout
+            sock.connect(str(self.socket_path))
+            sock.send(json.dumps(command).encode('utf-8'))
+            response = sock.recv(MAX_RESPONSE_SIZE).decode('utf-8')
+            sock.close()
+            
+            # Validate response is valid JSON
+            return json.loads(response)
+        except ConnectionRefusedError:
+            return {"status": "error", "message": f"Daemon not responding. Socket: {self.socket_path}"}
+        except FileNotFoundError:
+            return {"status": "error", "message": f"Socket not found at: {self.socket_path}"}
+        except json.JSONDecodeError:
+            return {"status": "error", "message": "Invalid response from daemon"}
+        except Exception as e:
+            return {"status": "error", "message": f"Socket error: {e} (Path: {self.socket_path})"}
+    
+    def _get_messages(self, conversation_hash=None):
+        """Read messages from JSONL file, optionally filtered by conversation"""
+        if not self.messages_file.exists():
+            return []
+        
+        messages = []
+        with open(self.messages_file, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                if line.strip():
+                    try:
+                        msg = json.loads(line)
+                        # Filter by conversation if specified
+                        if conversation_hash:
+                            if msg['from'] == conversation_hash or msg['to'] == conversation_hash:
+                                messages.append(msg)
+                        else:
+                            messages.append(msg)
+                    except json.JSONDecodeError:
+                        # Skip corrupted lines
+                        print(f"Warning: Skipping corrupted message at line {line_num}", file=sys.stderr)
+                        continue
+        return messages
+    
+    def _format_timestamp(self, timestamp):
+        """Format Unix timestamp for display"""
+        try:
+            dt = datetime.fromtimestamp(timestamp)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            # Handle invalid timestamps
+            return "Invalid Date"
+    
+    def _display_messages(self, messages, from_index=0):
+        """Display messages in a clean format"""
+        if from_index >= len(messages):
+            return
+        
+        for msg in messages[from_index:]:
+            timestamp = self._format_timestamp(msg['timestamp'])
+            if msg['outgoing']:
+                sender = "You"
+            else:
+                sender = self._get_contact_name(msg['from'])
+            print(f"[{timestamp}] {sender}: {msg['text']}")
+    
+    def _set_active_conversation(self, dest_hash):
+        """Set the active conversation"""
+        try:
+            dest_hash = clean_hash(dest_hash)
+        except ValueError as e:
+            print(f"Error: Invalid hash - {e}")
+            return False
+        
+        self.active_conversation = dest_hash
+        self.config['active_conversation'] = dest_hash
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config, f, indent=2)
+        return True
+    
+    def _send_message(self, text):
+        """Send a message to the active conversation"""
+        if not self.active_conversation:
+            print("Error: No active conversation")
+            return False
+        
+        command = {
+            "action": "send",
+            "to": self.active_conversation,
+            "text": text
+        }
+        
+        response = self._send_daemon_command(command)
+        
+        if response.get("status") == "ok":
+            return True
+        else:
+            print(f"Error sending message: {response.get('message', 'Unknown error')}")
+            return False
+    
+    def _check_for_new_messages(self):
+        """Check for and display new messages"""
+        messages = self._get_messages(self.active_conversation)
+        current_count = len(messages)
+        
+        if current_count > self.last_message_count:
+            # Display only new messages
+            new_messages = messages[self.last_message_count:]
+            for msg in new_messages:
+                timestamp = self._format_timestamp(msg['timestamp'])
+                if msg['outgoing']:
+                    sender = "You"
+                else:
+                    sender = self._get_contact_name(msg['from'])
+                
+                # Display the message
+                print(f"\r[{timestamp}] {sender}: {msg['text']}")
+                print("> ", end="", flush=True)  # Redraw prompt
+            
+            self.last_message_count = current_count
+    
+    def _watch_messages_file(self):
+        """Background thread to watch for file changes using inotify"""
+        inotify = INotify()
+        watch_flags = flags.MODIFY | flags.CREATE
+        
+        # Watch messages file
+        if not self.messages_file.exists():
+            self.messages_file.touch()
+        wd_messages = inotify.add_watch(str(self.messages_file), watch_flags)
+        
+        while self.watching:
+            # Wait for events with timeout
+            events = inotify.read(timeout=1000)  # 1 second timeout
+            if events:
+                # File was modified - check for new messages
+                self._check_for_new_messages()
+        
+        inotify.rm_watch(wd_messages)
+        inotify.close()
+    
+    def _start_watching(self):
+        """Start the file watch thread"""
+        self.watching = True
+        self.watch_thread = threading.Thread(target=self._watch_messages_file, daemon=True)
+        self.watch_thread.start()
+    
+    def _stop_watching(self):
+        """Stop the file watch thread"""
+        self.watching = False
+        if self.watch_thread:
+            self.watch_thread.join(timeout=2)
+    
+    def _get_recent_conversations(self):
+        """Get list of recent conversations with last message time"""
+        if not self.messages_file.exists():
+            return []
+        
+        conversations = {}
+        with open(self.messages_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    msg = json.loads(line)
+                    # Get the other party's hash
+                    other_hash = msg['to'] if msg['outgoing'] else msg['from']
+                    
+                    # Track most recent message time for each conversation
+                    if other_hash not in conversations or msg['timestamp'] > conversations[other_hash]['timestamp']:
+                        conversations[other_hash] = {
+                            'hash': other_hash,
+                            'timestamp': msg['timestamp'],
+                            'last_message': msg['text'][:50]  # First 50 chars
+                        }
+        
+        # Sort by most recent
+        return sorted(conversations.values(), key=lambda x: x['timestamp'], reverse=True)
+    
+    def _switch_conversation(self, hash_or_name):
+        """Switch to a different conversation"""
+        new_hash = self._hash_from_name_or_hash(hash_or_name)
+        
+        # Validate hash format (basic check)
+        if len(new_hash) < 32:
+            print(f"Error: Invalid hash or unknown nickname: {hash_or_name}")
+            return False
+        
+        self.active_conversation = new_hash
+        self.config['active_conversation'] = new_hash
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config, f, indent=2)
+        
+        # Reset message count and show history for new conversation
+        messages = self._get_messages(self.active_conversation)
+        self.last_message_count = len(messages)
+        
+        contact_name = self._get_contact_name(new_hash)
+        print(f"\n--- Switched to conversation with {contact_name} ---")
+        if messages:
+            print("--- Message History ---")
+            self._display_messages(messages[-10:])  # Show last 10 messages
+        else:
+            print("(no messages yet)")
+        print()
+        
+        return True
+    
+    def _set_contact_name(self, hash_str, nickname):
+        """Set a nickname for a contact"""
+        hash_str = clean_hash(hash_str)
+        
+        # Validate nickname (no special characters that could cause issues)
+        if not nickname or len(nickname) > 50:
+            print("Error: Nickname must be 1-50 characters")
+            return False
+        
+        self.contacts[hash_str] = nickname
+        self._save_contacts()
+        print(f"✓ Set nickname '{nickname}' for {hash_str[:8]}...")
+        return True
+    
+    def _show_welcome_screen(self):
+        """Display welcome screen with address, help, and recent conversations"""
+        print("\n" + "="*60)
+        print("RetiMsg - Reticulum Messaging")
+        print("="*60 + "\n")
+        
+        # Show user's LXMF address (this is what people should message)
+        lxmf_address = self.config.get("lxmf_address")
+        if lxmf_address:
+            print("Your RetiMsg Address:")
+            print(f"  {lxmf_address}")
+            print("(Share this with others so they can message you)\n")
+        else:
+            print("Initializing... (address will appear after daemon starts)\n")
+        
+        # Show available commands
+        print("Available Commands:")
+        print("  /list                    - Show recent conversations")
+        print("  /switch <number|name|hash> - Switch to a conversation")
+        print("  /name <nickname>         - Give current contact a nickname")
+        print("  /show                    - Show all messages in current conversation")
+        print("  /check                   - Manually check for new messages")
+        print("  /help                    - Show detailed help")
+        print()
+        
+        # Show recent conversations
+        convos = self._get_recent_conversations()
+        if convos:
+            print("Recent Conversations:")
+            for idx, convo in enumerate(convos[:5], 1):  # Show top 5, numbered
+                name = self._get_contact_name(convo['hash'])
+                timestamp = self._format_timestamp(convo['timestamp'])
+                preview = convo['last_message'][:40]  # Truncate preview
+                if len(convo['last_message']) > 40:
+                    preview += "..."
+                print(f"  {idx}. {name}")
+                print(f"      Last: {timestamp} - {preview}")
+            print()
+        else:
+            print("No conversations yet. Start one by entering a destination hash below.\n")
+        
+        print("="*60 + "\n")
+    
+    def run_interactive(self):
+        """Main interactive chat loop"""
+        
+        # Always show welcome screen on startup
+        self._show_welcome_screen()
+        
+        # Get or set active conversation
+        if not self.active_conversation:
+            print("\nNo active conversation.")
+            print("Enter a destination hash to start chatting, or use /switch <hash>")
+            dest_hash = input("> ").strip().replace(" ", "")
+            if not dest_hash:
+                print("No destination provided. Exiting.")
+                return
+            # Check if it's a command
+            if dest_hash.startswith("/"):
+                print("Starting without active conversation. Use /switch <hash> to begin.")
+            else:
+                if self._set_active_conversation(dest_hash):
+                    print(f"Conversation started with {dest_hash}")
+                    print()
+                else:
+                    print("Failed to set active conversation. Use /switch <hash> to try again.")
+        
+        # Display message history for active conversation
+        if self.active_conversation:
+            messages = self._get_messages(self.active_conversation)
+            if messages:
+                print("\n--- Message History ---")
+                self._display_messages(messages)
+                print()
+            self.last_message_count = len(messages)
+        else:
+            self.last_message_count = 0
+        
+        # Start watching for new messages in background
+        self._start_watching()
+        
+        # Enter live chat mode
+        print("--- Live Chat (Ctrl+C to exit) ---")
+        if self.active_conversation:
+            contact_name = self._get_contact_name(self.active_conversation)
+            print(f"Messaging: {contact_name}")
+        print("New messages will appear automatically.")
+        print("Type /help for commands")
+        print()
+        
+        try:
+            while True:
+                # Simple blocking input - user types and hits enter
+                text = input("> ").strip()
+                
+                if not text:
+                    # Empty line - do nothing (messages appear automatically now)
+                    continue
+                
+                if text == "/check":
+                    # Manual check for new messages
+                    before_count = self.last_message_count
+                    self._check_for_new_messages()
+                    if self.last_message_count == before_count:
+                        print("(no new messages)")
+                    continue
+                
+                if text == "/show":
+                    # Show all messages in conversation
+                    messages = self._get_messages(self.active_conversation)
+                    if messages:
+                        print("\n--- All Messages ---")
+                        self._display_messages(messages)
+                        print()
+                    else:
+                        print("(no messages)")
+                    continue
+                
+                if text == "/list":
+                    # Show recent conversations
+                    convos = self._get_recent_conversations()
+                    if convos:
+                        print("\n--- Recent Conversations ---")
+                        for idx, convo in enumerate(convos[:10], 1):  # Show top 10, numbered
+                            name = self._get_contact_name(convo['hash'])
+                            timestamp = self._format_timestamp(convo['timestamp'])
+                            preview = convo['last_message']
+                            active = " *" if convo['hash'] == self.active_conversation else ""
+                            print(f"{idx}. {name}{active}")
+                            print(f"   Last: {timestamp} - {preview}")
+                        print("\nUse /switch <number> or /switch <name|hash> to switch conversations")
+                        print()
+                    else:
+                        print("(no conversations yet)")
+                    continue
+                
+                if text.startswith("/switch "):
+                    # Switch conversation
+                    target = text[8:].strip()
+                    if target:
+                        # Check if target is a number (list index)
+                        if target.isdigit():
+                            idx = int(target)
+                            convos = self._get_recent_conversations()
+                            if 1 <= idx <= len(convos):
+                                target_hash = convos[idx - 1]['hash']
+                                self._switch_conversation(target_hash)
+                            else:
+                                print(f"Error: No conversation #{idx}. Use /list to see available conversations.")
+                        else:
+                            # It's a name or hash
+                            self._switch_conversation(target)
+                    else:
+                        print("Usage: /switch <number|name|hash>")
+                    continue
+                
+                if text.startswith("/name "):
+                    # Set nickname
+                    args = text[6:].strip().split(None, 1)
+                    if len(args) == 1:
+                        # /name <nickname> - for current conversation
+                        nickname = args[0]
+                        self._set_contact_name(self.active_conversation, nickname)
+                    elif len(args) == 2:
+                        # /name <hash> <nickname>
+                        hash_or_name, nickname = args
+                        target_hash = self._hash_from_name_or_hash(hash_or_name)
+                        self._set_contact_name(target_hash, nickname)
+                    else:
+                        print("Usage: /name <nickname>  OR  /name <hash> <nickname>")
+                    continue
+                
+                if text.startswith("/"):
+                    if text == "/help":
+                        print("\n=== RetiMsg Help ===\n")
+                        lxmf_address = self.config.get("lxmf_address", "Unknown")
+                        print("Your Address: " + lxmf_address)
+                        print("(Share this with others so they can message you)\n")
+                        print("Commands:")
+                        print("  /list")
+                        print("    Show all recent conversations with previews")
+                        print("\n  /switch <number|name|hash>")
+                        print("    Switch to a different conversation")
+                        print("    Example: /switch 1  OR  /switch Alice  OR  /switch abc123...")
+                        print("\n  /name <nickname>")
+                        print("    Give the current contact a friendly nickname")
+                        print("    Example: /name Alice")
+                        print("\n  /name <hash> <nickname>")
+                        print("    Give any contact a nickname")
+                        print("    Example: /name abc123... Bob")
+                        print("\n  /show")
+                        print("    Display all messages in current conversation")
+                        print("\n  /check")
+                        print("    Manually check for new messages (rarely needed)")
+                        print("\n  /help")
+                        print("    Show this help message\n")
+                        continue
+                    else:
+                        print("Unknown command. Type /help for available commands")
+                        continue
+                
+                # Send the message
+                if self._send_message(text):
+                    # Don't display or increment here - let the watcher handle it
+                    # The daemon will write to file, inotify will trigger, message appears
+                    pass
+                
+        except KeyboardInterrupt:
+            print("\n\nExiting...")
+            self._stop_watching()
+            return
+        except EOFError:
+            print("\nExiting...")
+            self._stop_watching()
+            return
+
+def main():
+    """Entry point"""
+    client = RetiMsgClient()
+    client.run_interactive()
+
+if __name__ == "__main__":
+    main()

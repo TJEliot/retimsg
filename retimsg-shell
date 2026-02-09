@@ -1,0 +1,104 @@
+#!/bin/sh
+#
+# RetiMsg Shell Wrapper
+# Restricted shell that launches retimsg client
+# Ensures user's daemon is running persistently
+#
+# File location: /usr/local/bin/retimsg-shell
+#
+
+DAEMON="/usr/local/bin/retimsg-daemon"
+SOCKET="$HOME/.retimsg/daemon.sock"
+PID_FILE="$HOME/.retimsg/daemon.pid"
+
+# Function to check if daemon is actually running
+is_daemon_running() {
+    # Check if PID file exists
+    if [ ! -f "$PID_FILE" ]; then
+        return 1
+    fi
+    
+    # Read PID
+    PID=$(cat "$PID_FILE" 2>/dev/null)
+    
+    # Check if process with that PID exists and is our daemon
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        # Process exists, verify it's actually the daemon
+        if [ -S "$SOCKET" ]; then
+            return 0
+        fi
+    fi
+    
+    # PID file is stale
+    return 1
+}
+
+# Function to start the daemon
+start_daemon() {
+    # Clean up stale files
+    rm -f "$SOCKET" "$PID_FILE"
+    
+    # Start daemon in background, but check for immediate failures
+    python3 "$DAEMON" </dev/null >"$HOME/.retimsg/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    
+    # Give it a moment to fail if there are obvious errors
+    sleep 0.5
+    
+    # Check if it died immediately
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "Error: Daemon failed to start (immediate crash)"
+        echo "Check log at: $HOME/.retimsg/daemon.log"
+        if [ -f "$HOME/.retimsg/daemon.log" ]; then
+            echo ""
+            echo "Last 10 lines of log:"
+            tail -10 "$HOME/.retimsg/daemon.log"
+        fi
+        return 1
+    fi
+    
+    # Wait for daemon to be ready (max 5 seconds)
+    for i in 1 2 3 4 5; do
+        sleep 1
+        if [ -S "$SOCKET" ]; then
+            return 0
+        fi
+        # Check if daemon process still exists
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "Error: Daemon died during startup"
+            echo "Check log at: $HOME/.retimsg/daemon.log"
+            if [ -f "$HOME/.retimsg/daemon.log" ]; then
+                echo ""
+                echo "Last 10 lines of log:"
+                tail -10 "$HOME/.retimsg/daemon.log"
+            fi
+            return 1
+        fi
+    done
+    
+    # Daemon still running but socket not ready
+    echo "Error: Daemon started but socket not ready after 5 seconds"
+    if [ -f "$HOME/.retimsg/daemon.log" ]; then
+        echo "Daemon log:"
+        cat "$HOME/.retimsg/daemon.log"
+    fi
+    return 1
+}
+
+# Main logic
+
+# Ensure .retimsg directory exists
+mkdir -p "$HOME/.retimsg"
+
+# Check if daemon is running
+if ! is_daemon_running; then
+    # Daemon not running, start it
+    if ! start_daemon; then
+        exit 1
+    fi
+fi
+
+# Launch retimsg client
+# exec replaces this shell process with retimsg
+# When retimsg exits, SSH session ends (no shell escape)
+exec /usr/local/bin/retimsg
