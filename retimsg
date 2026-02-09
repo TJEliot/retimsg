@@ -14,28 +14,7 @@ import readline  # Enables arrow keys and command history in input()
 from datetime import datetime
 from pathlib import Path
 from inotify_simple import INotify, flags
-
-# Security limit
-MAX_RESPONSE_SIZE = 2 * 1024 * 1024  # 2MB response limit
-
-def clean_hash(hash_input):
-    """Clean a hash from RNS format to plain hex string
-    
-    Handles both RNS.prettyhexrep output (with angle brackets) and raw strings.
-    Returns lowercase hex string without formatting.
-    Raises ValueError if input is None or empty.
-    """
-    if hash_input is None:
-        raise ValueError("Hash cannot be None")
-    
-    if isinstance(hash_input, bytes):
-        return hash_input.hex()
-    
-    hash_str = str(hash_input).strip()
-    if not hash_str:
-        raise ValueError("Hash cannot be empty")
-    
-    return hash_str.replace("<", "").replace(">", "").replace(" ", "").lower()
+from retimsg_utils import clean_hash, MAX_RESPONSE_SIZE
 
 class RetiMsgClient:
     def __init__(self):
@@ -51,7 +30,7 @@ class RetiMsgClient:
         # Check if daemon is running
         if not self.socket_path.exists():
             print(f"Error: Socket not found at {self.socket_path}")
-            print("Is the daemon running? Start with: python3 retimsg_daemon.py")
+            print("Is the daemon running? Start with: retimsg-daemon &")
             sys.exit(1)
         
         # Test connection
@@ -566,3 +545,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

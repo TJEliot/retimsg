@@ -15,32 +15,10 @@ import socket
 import logging
 from datetime import datetime
 from pathlib import Path
+from retimsg_utils import clean_hash, MAX_MESSAGE_SIZE, MAX_SOCKET_DATA
 
 # Version for config file format
 CONFIG_VERSION = "1.0"
-
-# Security limits
-MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB message limit
-MAX_SOCKET_DATA = 2 * 1024 * 1024  # 2MB socket read limit
-
-def clean_hash(hash_input):
-    """Clean a hash from RNS format to plain hex string
-    
-    Handles both RNS.prettyhexrep output (with angle brackets) and raw strings.
-    Returns lowercase hex string without formatting.
-    Raises ValueError if input is None or empty.
-    """
-    if hash_input is None:
-        raise ValueError("Hash cannot be None")
-    
-    if isinstance(hash_input, bytes):
-        return hash_input.hex()
-    
-    hash_str = str(hash_input).strip()
-    if not hash_str:
-        raise ValueError("Hash cannot be empty")
-    
-    return hash_str.replace("<", "").replace(">", "").replace(" ", "").lower()
 
 class RetiMsgDaemon:
     def __init__(self):
@@ -387,3 +365,4 @@ class RetiMsgDaemon:
 if __name__ == "__main__":
     daemon = RetiMsgDaemon()
     daemon.start()
+
