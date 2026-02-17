@@ -1,6 +1,6 @@
 # retimsg
 
-A mobile-friendly command-line chat interface for the [Reticulum](https://reticulum.network/) mesh networking protocol.
+A mobile-friendly command-line chat interface for the [Reticulum](https://reticulum.network/) mesh networking protocol. Designed specifically to work in mobile SSH terminal apps where richer interfaces like NomadNet don't function well.
 
 ## Overview
 
@@ -25,7 +25,7 @@ This separation allows the client to remain lightweight and responsive while the
 ## Requirements
 
 - Python 3
-- Reticulum Network Stack (RNS) - required by daemon only
+- Reticulum Network Stack (`rns`) and LXMF (`lxmf`) - required by daemon only
 - `inotify-simple` Python package - required by client only
 
 ## Installation
@@ -36,21 +36,19 @@ This separation allows the client to remain lightweight and responsive while the
 ```bash
 opkg update
 opkg install python3 python3-pip
-pip3 install rns inotify-simple
+pip3 install rns lxmf inotify-simple
 ```
 
-2. Copy retimsg components to `/usr/local/bin/`:
+2. Install retimsg components to `/usr/local/bin/`:
 ```bash
-# Make scripts executable
-chmod +x retimsg retimsg-daemon retimsg-shell retimsg_utils.py
-
-# Copy to system location
-cp retimsg retimsg-daemon retimsg-shell retimsg_utils.py /usr/local/bin/
+./install.sh
 ```
 
-3. Start the daemon:
+3. (Optional) Start the daemon manually to verify it works:
 ```bash
 retimsg-daemon &
+# Check log if it doesn't start:
+cat ~/.retimsg/daemon.log
 ```
 
 4. (Optional) Set up autolaunch for convenience:
@@ -91,7 +89,27 @@ Once daemon is running:
 retimsg
 ```
 
-This launches the interactive chat interface. Use arrow keys for command history.
+On first launch retimsg will display **your LXMF address** — share this with anyone who wants to message you. Then either enter a contact's hash to start a conversation, or use `/switch <hash>` if you already have one.
+
+The client supports arrow keys and command history via readline.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `/list` | Show recent conversations |
+| `/switch <number\|name\|hash>` | Switch to a conversation (number from `/list`, nickname, or full hash) |
+| `/name <nickname>` | Give the current contact a nickname |
+| `/name <hash> <nickname>` | Give any contact a nickname |
+| `/show` | Display all messages in the current conversation |
+| `/check` | Manually check for new messages |
+| `/help` | Show in-app help including your LXMF address |
+
+New messages appear automatically without polling — the client watches `messages.jsonl` via inotify.
+
+### Contacts / Nicknames
+
+Nicknames are stored in `~/.retimsg/contacts.json`. Once you assign a nickname with `/name`, it appears everywhere in place of the raw hash.
 
 ### Checking Daemon Status
 
@@ -101,7 +119,7 @@ If the client reports the daemon isn't running:
 ls -la ~/.retimsg/daemon.sock
 
 # Check daemon log for errors
-tail ~/.retimsg/daemon.log
+cat ~/.retimsg/daemon.log
 
 # Restart daemon if needed
 retimsg-daemon &
@@ -141,6 +159,4 @@ Pull requests welcome. This is a personal project but contributions that improve
 - Encrypt stored messages (currently stored as plain JSON)
 - Add announce functionality (broadcast presence on Reticulum network)
 - Add the ability to view the announce stream (see who's online)
-- Refactor shared code into retimsg_utils.py module
-- Add proper error handling for daemon crashes
-- Implement message delivery confirmation
+- Add proper error handling for daemon crashes / restart logic
